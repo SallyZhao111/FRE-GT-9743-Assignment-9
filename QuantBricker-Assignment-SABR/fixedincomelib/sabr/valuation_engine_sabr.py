@@ -23,7 +23,27 @@ class ValuationEngineRFRCapletFloorlet(ValuationEngineProduct):
         request: ValuationRequest,
     ):
         super().__init__(model, valuation_parameters_collection, product, request)
-        
+        self.is_cap_floor_ = isinstance(product, ProductRFRCapFloor)
+
+        if self.is_cap_floor_:
+            self.currency_ = product.currency
+            self.caplet_engines_ = [
+                ValuationEngineRFRCapletFloorlet(
+                    model,
+                    valuation_parameters_collection,
+                    product.caplets(i),
+                    request,
+                )
+                for i in range(product.num_caplets())
+            ]
+
+            self.value_ = 0.0
+            self.cash_ = 0.0
+            self.option_value_ = 0.0
+            self.sabr_result_ = {}
+            self.first_order_risk_ = {}
+            return
+                
         # get info from product
         self.currency_ = product.currency
         self.expiry_date_ = product.expiry_date
@@ -83,7 +103,22 @@ class ValuationEngineRFRCapletFloorlet(ValuationEngineProduct):
         #
         # where R(0) = self.index_engine_.calculateValue => get value
         #       \tau = acc(t_s, t_m)
+        if getattr(self, "is_cap_floor_", False):
+            self.value_ = 0.0
+            self.cash_ = 0.0
+            self.option_value_ = 0.0
+            self.sabr_result_ = {}
 
+            for engine in self.caplet_engines_:
+                engine.calculate_value()
+                self.value_ += engine.value_
+                self.cash_ += engine.cash_
+                self.option_value_ += engine.option_value_
+
+            if len(self.caplet_engines_) > 0:
+                self.sabr_result_ = self.caplet_engines_[-1].sabr_result_
+
+            return
         self.value_ = 0.0
         self.cash_ = 0.0
         self.df_ = 1.0
@@ -145,6 +180,25 @@ class ValuationEngineRFRCapletFloorlet(ValuationEngineProduct):
             self.value_ = scaler * self.df_ * self.accrual_ * self.option_value_
 
     def calculate_first_order_risk(self, gradient=None, scaler = 1.0, accumulate = False):
+        if getattr(self, "is_cap_floor_", False):
+            if gradient is None:
+                gradient = []
+
+            self.model_.resize_gradient(gradient)
+
+            if not accumulate:
+                for i in range(len(gradient)):
+                    gradient[i] = 0.0 * gradient[i]
+
+            for engine in self.caplet_engines_:
+                engine.calculate_first_order_risk(
+                    gradient,
+                    scaler,
+                    True,
+                )
+
+            self.first_order_risk_ = gradient
+            return
 
         if self.value_ is None:
             self.calculate_value()
@@ -244,6 +298,33 @@ class ValuationEngineRFRCapletFloorlet(ValuationEngineProduct):
         self.first_order_risk_ = gradient
     
     def create_cash_flows_report(self) -> CashflowsReport:
+        if getattr(self, "is_cap_floor_", False):
+            this_cf = CashflowsReport()
+
+            for i, engine in enumerate(self.caplet_engines_):
+                if engine.value_ is None:
+                    engine.calculate_value()
+
+                this_cf.add_row(
+                    i,
+                    engine.product_._product_type,
+                    engine.val_engine_type(),
+                    engine.notional_,
+                    engine.sign_,
+                    engine.pay_date_,
+                    engine.value_ / engine.df_ if engine.df_ != 0.0 else 0.0,
+                    engine.value_,
+                    engine.df_,
+                    fixing_date=engine.expiry_date_,
+                    start_date=engine.effective_date_,
+                    end_date=engine.termination_date_,
+                    accrued=engine.accrual_,
+                    index_or_fixed=engine.overnight_index_.name(),
+                    index_value=engine.forward_,
+                )
+
+            return this_cf
+
         this_cf = CashflowsReport()
         this_cf.add_row(
             0,
@@ -272,10 +353,13 @@ class ValuationEngineRFRCapletFloorlet(ValuationEngineProduct):
 
     
 
+# _SABR_ENGINE_MAP = {
+#     ProductRFRCapletFloorlet._product_type:     ValuationEngineRFRCapletFloorlet,
+# }
 _SABR_ENGINE_MAP = {
-    ProductRFRCapletFloorlet._product_type:     ValuationEngineRFRCapletFloorlet,
+    ProductRFRCapletFloorlet._product_type: ValuationEngineRFRCapletFloorlet,
+    ProductRFRCapFloor._product_type: ValuationEngineRFRCapletFloorlet,
 }
-
 for prod_type, eng_cls in _SABR_ENGINE_MAP.items():
     ValuationEngineProductRegistry().register(
         (SABRModel._model_type.to_string(), prod_type, AnalyticValParam._vp_type),
